@@ -1,3 +1,9 @@
+//! # Laravel Rust Bridge
+//!
+//! Этот модуль реализует мост между Laravel (PHP) и Rust, позволяя
+//! обрабатывать HTTP-запросы через Rust-сервер, который взаимодействует
+//! с PHP-приложением Laravel через Unix-сокет.
+
 use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -8,6 +14,12 @@ use std::time::Duration;
 mod bridge;
 mod server;
 use server::HttpServer;
+
+// Константы для конфигурации
+const DEFAULT_SOCKET_PATH: &str = "/tmp/rust_php_bridge.sock";
+const SOCKET_WAIT_MAX_ATTEMPTS: usize = 20;
+const SOCKET_WAIT_INTERVAL_MS: u64 = 500;
+const SHUTDOWN_CHECK_INTERVAL_MS: u64 = 100;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -34,34 +46,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     // Проверяем, что сокет создан и готов к использованию
-    let socket_path = std::env::var("SOCKET_PATH").unwrap_or_else(|_| "/tmp/rust_php_bridge.sock".to_string());
-    let mut attempts = 0;
-    let max_attempts = 20; // 10 seconds max wait
-
-    println!("⏳ Ожидаем готовности PHP worker и сокета...");
-    while attempts < max_attempts {
-        if std::path::Path::new(&socket_path).exists() {
-            // Проверяем, можно ли подключиться к сокету
-            match std::os::unix::net::UnixStream::connect(&socket_path) {
-                Ok(_) => {
-                    println!("✅ Сокет PHP worker готов к использованию");
-                    break;
-                }
-                Err(_) => {
-                    // Сокет существует, но не готов к подключению, ждем
-                    thread::sleep(Duration::from_millis(500));
-                    attempts += 1;
-                }
-            }
-        } else {
-            thread::sleep(Duration::from_millis(500));
-            attempts += 1;
-        }
-    }
-
-    if attempts >= max_attempts {
-        eprintln!("⚠️ PHP worker не готов к подключению в течение 10 секунд");
-    }
+    let socket_path = std::env::var("SOCKET_PATH").unwrap_or_else(|_| DEFAULT_SOCKET_PATH.to_string());
+    let _ = wait_for_php_worker(&socket_path);
 
     // Создаем и запускаем Rust HTTP сервер
     let socket_bridge = match crate::bridge::socket_bridge::SocketBridge::new() {
@@ -91,7 +77,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // Ждем сигнал завершения
     while running.load(Ordering::SeqCst) {
-        thread::sleep(Duration::from_millis(100));
+        thread::sleep(Duration::from_millis(SHUTDOWN_CHECK_INTERVAL_MS));
     }
 
     // Завершаем PHP процесс
@@ -114,6 +100,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 }
 
 /// Инициализация системы логирования с поддержкой записи в файл
+///
+/// Настраивает логирование в файл и в консоль с возможностью фильтрации
+/// по уровням и сохранения в директорию, указанную в переменных окружения.
+///
+/// # Returns
+///
+/// * `Ok(())` - если логирование успешно инициализировано
+/// * `Err` - если произошла ошибка при настройке логирования
 fn init_logging() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use std::fs;
     use tracing_subscriber::fmt;
@@ -170,6 +164,56 @@ fn init_logging() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     Ok(())
 }
 
+/// Ожидание готовности PHP worker
+///
+/// Проверяет существование Unix-сокета и возможность подключения к нему
+/// в течение определенного времени.
+///
+/// # Arguments
+///
+/// * `socket_path` - путь к Unix-сокету, который использует PHP worker
+///
+/// # Returns
+///
+/// * `Ok(())` - если сокет готов к использованию
+/// * `Err` - если сокет не готов в течение отведенного времени
+fn wait_for_php_worker(socket_path: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut attempts = 0;
+
+    println!("⏳ Ожидаем готовности PHP worker и сокета...");
+    while attempts < SOCKET_WAIT_MAX_ATTEMPTS {
+        if std::path::Path::new(socket_path).exists() {
+            // Проверяем, можно ли подключиться к сокету
+            match std::os::unix::net::UnixStream::connect(socket_path) {
+                Ok(_) => {
+                    println!("✅ Сокет PHP worker готов к использованию");
+                    return Ok(());
+                }
+                Err(_) => {
+                    // Сокет существует, но не готов к подключению, ждем
+                    thread::sleep(Duration::from_millis(SOCKET_WAIT_INTERVAL_MS));
+                    attempts += 1;
+                }
+            }
+        } else {
+            thread::sleep(Duration::from_millis(SOCKET_WAIT_INTERVAL_MS));
+            attempts += 1;
+        }
+    }
+
+    eprintln!("⚠️ PHP worker не готов к подключению в течение 10 секунд");
+    Err("PHP worker не готов к подключению".into())
+}
+
+/// Запуск PHP worker процесса
+///
+/// Запускает PHP процесс с Laravel artisan командой, которая создает
+/// сервер для обработки запросов из Rust.
+///
+/// # Returns
+///
+/// * `Ok(Child)` - дескриптор дочернего процесса PHP worker
+/// * `Err` - ошибка запуска процесса
 fn start_php_worker() -> Result<std::process::Child, Box<dyn std::error::Error + Send + Sync + 'static>> {
     // Получаем путь к PHP из переменной окружения или используем стандартный
     let php_path = std::env::var("PHP_PATH").unwrap_or_else(|_| "php".to_string());

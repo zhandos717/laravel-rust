@@ -1,4 +1,5 @@
 pub mod socket_bridge;
+pub mod connection_pool;
 
 use serde::{Deserialize, Serialize};
 
