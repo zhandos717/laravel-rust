@@ -1,0 +1,27 @@
+# Бинарные файлы и результаты сборки
+/target/
+**/target/
+
+# Временные файлы Cargo
+Cargo.lock
+
+# Временные файлы IDE
+.vscode/
+.idea/
+
+# Скомпилированные библиотеки
+*.so
+*.dylib
+*.dll
+
+# Лог-файлы
+*.log
+logs/
+
+# Файлы окружения (кроме .env.example)
+.env
+.env.local
+.env.*.local
+
+# Исключаем .env.example из игнора, если он существует
+!.env.example
