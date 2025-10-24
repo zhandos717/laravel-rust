@@ -1,3 +1,4 @@
+use anyhow::Result;
 use base64;
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{header, Body, Request, Response, Server, StatusCode};
@@ -7,28 +8,7 @@ use tracing::{debug, error, info};
 
 use crate::bridge::socket_bridge::SocketBridge;
 
-/// Configuration for the HTTP server
-#[derive(Debug, Clone)]
-pub struct ServerConfig {
-    pub port: u16,
-    pub host: String,
-    pub socket_path: String,
-}
-
-impl ServerConfig {
-    pub fn from_env() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        dotenvy::dotenv().ok();
-
-        Ok(ServerConfig {
-            port: std::env::var("HTTP_PORT")
-                .unwrap_or_else(|_| "8080".to_string())
-                .parse()
-                .unwrap_or(8080),
-            host: std::env::var("HTTP_HOST").unwrap_or_else(|_| "127.0.0.1".to_string()),
-            socket_path: std::env::var("SOCKET_PATH").unwrap_or_else(|_| "/tmp/rust_php_bridge.sock".to_string()),
-        })
-    }
-}
+use crate::config::AppConfig;
 
 /// Represents an HTTP request that will be forwarded to Laravel
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -50,7 +30,7 @@ pub struct HttpResponsePayload {
 
 /// Main HTTP server struct
 pub struct HttpServer {
-    config: ServerConfig,
+    config: crate::config::ServerConfig,
     socket_bridge: Arc<SocketBridge>,
 }
 
@@ -58,19 +38,31 @@ impl HttpServer {
     /// Create a new HTTP server instance
     pub async fn new(
         socket_bridge: Arc<SocketBridge>,
-    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync + 'static>> {
-        let config = ServerConfig::from_env()?;
+    ) -> Result<Self> {
+        dotenvy::dotenv().ok();
+        let config = crate::config::ServerConfig::from_env()?;
 
         Ok(HttpServer { config, socket_bridge })
     }
 
+    /// Create a new HTTP server instance with configuration
+    pub async fn new_with_config(
+        socket_bridge: Arc<SocketBridge>,
+        app_config: &AppConfig,
+    ) -> Result<Self> {
+        Ok(HttpServer {
+            config: app_config.server.clone(),
+            socket_bridge
+        })
+    }
+
     /// Start the HTTP server
-    pub async fn start(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
+    pub async fn start(&self) -> Result<()> {
         let addr = format!("{}:{}", self.config.host, self.config.port)
             .parse()
             .map_err(|e| {
                 error!("Failed to parse server address: {}", e);
-                Box::new(e) as Box<dyn std::error::Error + Send + Sync>
+                Box::new(e)
             })?;
 
         let socket_bridge = self.socket_bridge.clone();
@@ -92,14 +84,11 @@ impl HttpServer {
         let server = Server::try_bind(&addr)
             .map_err(|e| {
                 error!("Failed to bind to {}: {}", addr, e);
-                Box::new(e) as Box<dyn std::error::Error + Send + Sync>
+                Box::new(e)
             })?
             .serve(make_svc);
 
-        server.await.map_err(|e| {
-            error!("Server error: {}", e);
-            Box::new(e) as Box<dyn std::error::Error + Send + Sync>
-        })
+        server.await.map_err(|e| anyhow::Error::from(e))
     }
 }
 
@@ -117,7 +106,11 @@ async fn handle_request(req: Request<Body>, socket_bridge: Arc<SocketBridge>) ->
     let method = req.method().clone();
     let uri = req.uri().clone();
     let headers = req.headers().clone();
-    let body_bytes = hyper::body::to_bytes(req.into_body()).await.unwrap_or_default();
+    let body_bytes = hyper::body::to_bytes(req.into_body()).await
+        .map_err(|e| {
+            tracing::error!("Failed to read request body: {}", e);
+            hyper::Error::from(e)
+        })?;
 
     // Convert headers to HashMap
     let mut header_map = std::collections::HashMap::new();
@@ -148,7 +141,8 @@ async fn handle_request(req: Request<Body>, socket_bridge: Arc<SocketBridge>) ->
         Ok(response) => Ok(response),
         Err(e) => {
             error!("Error forwarding request to Laravel: {}", e);
-            Ok(internal_server_error())
+            // Use the centralized error handler
+            Ok(crate::errors::handle_error_response(e))
         }
     }
 }
@@ -204,14 +198,24 @@ async fn handle_static_file_request(uri_path: &str) -> Result<Response<Body>, hy
                 response = response.header(header::CACHE_CONTROL, "public, max-age=86400"); // 1 day
             }
 
-            Ok(response.body(Body::from(contents)).unwrap())
+            Ok(response.body(Body::from(contents)).unwrap_or_else(|_| {
+                Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(Body::from("Failed to create response"))
+                    .unwrap()
+            }))
         }
         Err(_) => {
             // File not found - return 404
             Ok(Response::builder()
                 .status(StatusCode::NOT_FOUND)
                 .body(Body::from("File not found"))
-                .unwrap())
+                .unwrap_or_else(|_| {
+                    Response::builder()
+                        .status(StatusCode::INTERNAL_SERVER_ERROR)
+                        .body(Body::from("Failed to create response"))
+                        .unwrap()
+                }))
         }
     }
 }
@@ -251,7 +255,7 @@ fn get_content_type(file_path: &str) -> &'static str {
 async fn forward_to_laravel(
     socket_bridge: &Arc<SocketBridge>,
     payload: HttpRequestPayload,
-) -> Result<Response<Body>, Box<dyn std::error::Error + Send + Sync + 'static>> {
+) -> Result<Response<Body>> {
     // Create a direct HTTP request format that matches what PHP expects
     let http_request_data = serde_json::json!({
         "uri": payload.uri.clone(),
@@ -278,19 +282,16 @@ async fn forward_to_laravel(
                     if let Some(response_data) = response.data {
                         // Parse Laravel's response - it might be in the format:
                         // {"body": "...", "headers": {...}, "status": 200}
-                        let http_response: HttpResponsePayload = match parse_laravel_response(response_data) {
-                            Ok(response) => response,
-                            Err(e) => {
-                                error!("Failed to parse Laravel response: {}", e);
+                        let http_response: HttpResponsePayload = parse_laravel_response(response_data).unwrap_or_else(|e| {
+                            error!("Failed to parse Laravel response: {}", e);
 
-                                // Fallback for other response formats
-                                HttpResponsePayload {
-                                    status: 200,
-                                    headers: std::collections::HashMap::new(),
-                                    body: format!("Error parsing Laravel response: {}", e),
-                                }
+                            // Fallback for other response formats
+                            HttpResponsePayload {
+                                status: 200,
+                                headers: std::collections::HashMap::new(),
+                                body: format!("Error parsing Laravel response: {}", e),
                             }
-                        };
+                        });
 
                         // Determine content type and handle response body appropriately
                         let content_type = http_response
@@ -308,7 +309,7 @@ async fn forward_to_laravel(
                                     // The response is valid JSON, use it as-is
                                     Body::from(
                                         serde_json::to_string(&json_value)
-                                            .unwrap_or_else(|_| http_response.body.clone()),
+                                            .map_err(|e| anyhow::anyhow!("Failed to serialize JSON response: {}", e))?,
                                     )
                                 }
                                 Err(_) => {
@@ -340,15 +341,22 @@ async fn forward_to_laravel(
 
                         // Build response
                         let mut response_builder = Response::builder()
-                            .status(StatusCode::from_u16(http_response.status).unwrap_or(StatusCode::OK));
+                            .status(StatusCode::from_u16(http_response.status)
+                                .map_err(|_| anyhow::anyhow!("Invalid status code: {}", http_response.status))?);
 
                         // Add headers
                         for (key, value) in http_response.headers {
-                            if let Ok(header_name) = hyper::header::HeaderName::from_bytes(key.as_bytes()) {
-                                // Убираем потенциальные символы новой строки или пробелы в значениях заголовков
-                                let clean_value = value.trim().to_string();
-                                if !clean_value.is_empty() {
-                                    response_builder = response_builder.header(header_name, clean_value);
+                            match hyper::header::HeaderName::from_bytes(key.as_bytes()) {
+                                Ok(header_name) => {
+                                    // Убираем потенциальные символы новой строки или пробелы в значениях заголовков
+                                    let clean_value = value.trim().to_string();
+                                    if !clean_value.is_empty() {
+                                        response_builder = response_builder.header(header_name, clean_value);
+                                    }
+                                }
+                                Err(_) => {
+                                    // If header name is invalid, log and continue
+                                    tracing::warn!("Invalid header name: {}", key);
                                 }
                             }
                         }
@@ -392,7 +400,7 @@ async fn forward_to_laravel(
 /// Parse Laravel response format
 fn parse_laravel_response(
     response_data: serde_json::Value,
-) -> Result<HttpResponsePayload, Box<dyn std::error::Error + Send + Sync + 'static>> {
+) -> Result<HttpResponsePayload> {
     // Check if response_data has the format: {"body": "...", "headers": {...}, "status": 200}
     if let Some(obj) = response_data.as_object() {
         // Check if it has the expected format with body, headers, and status
@@ -557,5 +565,11 @@ fn internal_server_error() -> Response<Body> {
     Response::builder()
         .status(StatusCode::INTERNAL_SERVER_ERROR)
         .body(Body::from("Internal Server Error"))
-        .unwrap()
+        .unwrap_or_else(|_| {
+            // Fallback response in case the builder fails
+            Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Body::from("Internal Server Error"))
+                .unwrap() // This should never panic as we're using valid status and body
+        })
 }

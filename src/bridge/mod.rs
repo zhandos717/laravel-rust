@@ -1,7 +1,8 @@
+use serde::{Deserialize, Serialize};
+
 pub mod socket_bridge;
 pub mod connection_pool;
-
-use serde::{Deserialize, Serialize};
+pub mod retry;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct PhpResponse {

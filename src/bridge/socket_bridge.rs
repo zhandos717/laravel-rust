@@ -1,4 +1,6 @@
+use anyhow::Result;
 use crate::bridge::connection_pool::{ConnectionPool, ConnectionPoolConfig};
+use crate::bridge::retry::{RetryConfig, retry_with_backoff};
 use crate::bridge::PhpResponse;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -28,7 +30,7 @@ pub struct SocketBridge {
 
 impl SocketBridge {
     #[allow(dead_code)]
-    pub fn new() -> Result<Arc<Self>, Box<dyn std::error::Error + Send + Sync>> {
+    pub fn new() -> Result<Arc<Self>> {
         // Load environment variables
         dotenvy::dotenv().ok();
 
@@ -48,23 +50,75 @@ impl SocketBridge {
             cleanup_on_drop: Arc::new(AsyncMutex::new(())),
         });
 
-        // Initialize the pool with minimum connections
+        // Initialize the pool with minimum connections in a background task
+        // This ensures connections are pre-established but doesn't block the creation
         let bridge_clone = bridge.clone();
         tokio::spawn(async move {
-            if let Err(e) = bridge_clone.connection_pool.initialize().await {
-                eprintln!("Failed to initialize connection pool: {}", e);
+            let retry_config = crate::bridge::retry::RetryConfig::from_env();
+            if let Err(e) = retry_with_backoff(
+                &retry_config,
+                "initialize_connection_pool",
+                || async {
+                    bridge_clone.connection_pool.initialize().await
+                }
+            ).await {
+                eprintln!("Failed to initialize connection pool after all retry attempts: {}", e);
+                // Still continue even if initialization failed, as connections can be created on-demand
             }
         });
 
         Ok(bridge)
     }
 
+    #[allow(dead_code)]
+    pub fn new_with_config(app_config: &crate::config::AppConfig) -> Result<Arc<Self>> {
+        let config = SocketBridgeConfig {
+            socket_path: app_config.connection.socket_path.clone()
+        };
+
+        // Create connection pool with configuration from app config
+        let pool_config = ConnectionPool::create_config_from_app_config(app_config);
+        let connection_pool = Arc::new(ConnectionPool::new(pool_config));
+
+        // Initialize the pool with minimum connections
+        let bridge = Arc::new(Self {
+            config,
+            connection_pool,
+            cleanup_on_drop: Arc::new(AsyncMutex::new(())),
+        });
+
+        // Initialize the pool with minimum connections in a background task
+        // This ensures connections are pre-established but doesn't block the creation
+        let bridge_clone = bridge.clone();
+        let retry_config = crate::bridge::retry::RetryConfig {
+            max_attempts: app_config.retry.max_attempts,
+            base_delay: app_config.retry.base_delay,
+            max_delay: app_config.retry.max_delay,
+        };
+        
+        // Spawn initialization task to ensure connections are ready before the server starts handling requests
+        tokio::spawn(async move {
+            if let Err(e) = retry_with_backoff(
+                &retry_config,
+                "initialize_connection_pool",
+                || async {
+                    bridge_clone.connection_pool.initialize().await
+                }
+            ).await {
+                eprintln!("Failed to initialize connection pool after all retry attempts: {}", e);
+                // Still continue even if initialization failed, as connections can be created on-demand
+            }
+        });
+
+        Ok(bridge)
+    }
+    
     
     #[allow(dead_code)]
     pub async fn send_http_request(
         &self,
         http_request_data: serde_json::Value,
-    ) -> Result<PhpResponse, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<PhpResponse> {
         self.connection_pool.send_http_request(http_request_data).await
     }
 }

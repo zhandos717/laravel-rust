@@ -4,6 +4,7 @@
 //! обрабатывать HTTP-запросы через Rust-сервер, который взаимодействует
 //! с PHP-приложением Laravel через Unix-сокет.
 
+use anyhow::Result;
 use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,16 +14,19 @@ use std::time::Duration;
 
 mod bridge;
 mod server;
+mod errors;
+mod config;
 use server::HttpServer;
+use config::AppConfig;
 
-// Константы для конфигурации
+// Константы для конфигурации (для обратной совместимости)
 const DEFAULT_SOCKET_PATH: &str = "/tmp/rust_php_bridge.sock";
 const SOCKET_WAIT_MAX_ATTEMPTS: usize = 20;
 const SOCKET_WAIT_INTERVAL_MS: u64 = 500;
 const SHUTDOWN_CHECK_INTERVAL_MS: u64 = 100;
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn main() -> Result<()> {
     // Инициализируем систему логирования
     init_logging()?;
 
@@ -45,20 +49,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Err(e) => eprintln!("❌ Ошибка запуска PHP worker: {}", e),
     }
 
+    // Загружаем конфигурацию приложения
+    let config = match AppConfig::from_env() {
+        Ok(config) => {
+            if let Err(validation_err) = config.validate() {
+                eprintln!("❌ Ошибка валидации конфигурации: {}", validation_err);
+                return Err(validation_err);
+            }
+            config
+        }
+        Err(e) => {
+            eprintln!("❌ Ошибка загрузки конфигурации: {}", e);
+            return Err(e);
+        }
+    };
+
     // Проверяем, что сокет создан и готов к использованию
-    let socket_path = std::env::var("SOCKET_PATH").unwrap_or_else(|_| DEFAULT_SOCKET_PATH.to_string());
-    let _ = wait_for_php_worker(&socket_path);
+    let _ = wait_for_php_worker(&config.connection.socket_path);
 
     // Создаем и запускаем Rust HTTP сервер
-    let socket_bridge = match crate::bridge::socket_bridge::SocketBridge::new() {
+    let socket_bridge = match crate::bridge::socket_bridge::SocketBridge::new_with_config(&config) {
         Ok(bridge) => bridge,
         Err(e) => {
             eprintln!("Ошибка инициализации SocketBridge: {}", e);
             return Err(e.into());
         }
     };
+    println!("✅ Rust HTTP сервер готов к работе");
 
-    let server = match HttpServer::new(socket_bridge.clone()).await {
+    let server = match HttpServer::new_with_config(socket_bridge.clone(), &config).await {
         Ok(server) => server,
         Err(e) => {
             eprintln!("Ошибка инициализации HTTP сервера: {}", e);
@@ -77,7 +96,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // Ждем сигнал завершения
     while running.load(Ordering::SeqCst) {
-        thread::sleep(Duration::from_millis(SHUTDOWN_CHECK_INTERVAL_MS));
+        thread::sleep(config.connection.shutdown_check_interval);
     }
 
     // Завершаем PHP процесс
@@ -108,7 +127,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 ///
 /// * `Ok(())` - если логирование успешно инициализировано
 /// * `Err` - если произошла ошибка при настройке логирования
-fn init_logging() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+fn init_logging() -> Result<()> {
     use std::fs;
     use tracing_subscriber::fmt;
     use tracing_subscriber::EnvFilter;
@@ -175,13 +194,23 @@ fn init_logging() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 ///
 /// # Returns
 ///
-/// * `Ok(())` - если сокет готов к использованию
+/// * `Ok())` - если сокет готов к использованию
 /// * `Err` - если сокет не готов в течение отведенного времени
-fn wait_for_php_worker(socket_path: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+fn wait_for_php_worker(socket_path: &str) -> Result<()> {
     let mut attempts = 0;
+    
+    // Для обратной совместимости используем конфигурацию по умолчанию
+    let max_attempts = std::env::var("SOCKET_WAIT_MAX_ATTEMPTS")
+        .unwrap_or_else(|_| "10".to_string())  // Reduced from 20 to 10
+        .parse()
+        .unwrap_or(10);
+    let interval = std::env::var("SOCKET_WAIT_INTERVAL_MS")
+        .unwrap_or_else(|_| "250".to_string())  // Reduced from 50 to 250ms
+        .parse()
+        .unwrap_or(250);
 
     println!("⏳ Ожидаем готовности PHP worker и сокета...");
-    while attempts < SOCKET_WAIT_MAX_ATTEMPTS {
+    while attempts < max_attempts {
         if std::path::Path::new(socket_path).exists() {
             // Проверяем, можно ли подключиться к сокету
             match std::os::unix::net::UnixStream::connect(socket_path) {
@@ -191,18 +220,18 @@ fn wait_for_php_worker(socket_path: &str) -> Result<(), Box<dyn std::error::Erro
                 }
                 Err(_) => {
                     // Сокет существует, но не готов к подключению, ждем
-                    thread::sleep(Duration::from_millis(SOCKET_WAIT_INTERVAL_MS));
+                    thread::sleep(Duration::from_millis(interval));
                     attempts += 1;
                 }
             }
         } else {
-            thread::sleep(Duration::from_millis(SOCKET_WAIT_INTERVAL_MS));
+            thread::sleep(Duration::from_millis(interval));
             attempts += 1;
         }
     }
 
-    eprintln!("⚠️ PHP worker не готов к подключению в течение 10 секунд");
-    Err("PHP worker не готов к подключению".into())
+    eprintln!("⚠️ PHP worker не готов к подключению в течение {} секунд", (max_attempts * interval) / 1000);
+    Err(anyhow::anyhow!("PHP worker не готов к подключению"))
 }
 
 /// Запуск PHP worker процесса
@@ -214,7 +243,7 @@ fn wait_for_php_worker(socket_path: &str) -> Result<(), Box<dyn std::error::Erro
 ///
 /// * `Ok(Child)` - дескриптор дочернего процесса PHP worker
 /// * `Err` - ошибка запуска процесса
-fn start_php_worker() -> Result<std::process::Child, Box<dyn std::error::Error + Send + Sync + 'static>> {
+fn start_php_worker() -> Result<std::process::Child> {
     // Получаем путь к PHP из переменной окружения или используем стандартный
     let php_path = std::env::var("PHP_PATH").unwrap_or_else(|_| "php".to_string());
 
@@ -232,7 +261,7 @@ fn start_php_worker() -> Result<std::process::Child, Box<dyn std::error::Error +
     let artisan_path = std::path::Path::new(&laravel_path).join("artisan");
 
     if !artisan_path.exists() {
-        return Err(format!("Файл artisan не найден по пути: {:?}", artisan_path).into());
+        return Err(anyhow::anyhow!("Файл artisan не найден по пути: {:?}", artisan_path));
     }
 
     // Получаем команду запуска из переменной окружения
@@ -244,7 +273,7 @@ fn start_php_worker() -> Result<std::process::Child, Box<dyn std::error::Error +
 
     let child = cmd
         .spawn()
-        .map_err(|e| format!("Ошибка при запуске PHP worker: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Ошибка при запуске PHP worker: {}", e))?;
 
     Ok(child)
 }
