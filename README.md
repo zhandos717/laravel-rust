@@ -86,6 +86,10 @@ All configuration is handled through environment variables:
 | `LOG_LEVEL` | info | Logging level (trace, debug, info, warn, error) |
 | `LOG_DIR` | ./logs | Directory for log files |
 | `STARTUP_COMMAND` | laravel-rust:serve | Laravel Artisan command to start the PHP worker |
+| `SOCKET_POOL_MIN` | 2 | Minimum number of connections in the pool |
+| `SOCKET_POOL_MAX` | 10 | Maximum number of connections in the pool |
+| `SOCKET_CONNECTION_TIMEOUT` | 5 | Connection timeout in seconds |
+| `SOCKET_HEALTH_CHECK_INTERVAL` | 30 | Health check interval in seconds |
 
 ## Performance Optimizations
 
