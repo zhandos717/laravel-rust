@@ -2,7 +2,6 @@ use base64;
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{header, Body, Request, Response, Server, StatusCode};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, error, info};
 
@@ -108,6 +107,12 @@ impl HttpServer {
 async fn handle_request(req: Request<Body>, socket_bridge: Arc<SocketBridge>) -> Result<Response<Body>, hyper::Error> {
     debug!("Received request: {} {}", req.method(), req.uri());
 
+    // Check if this is a static file request (favicon.ico, assets, etc.)
+    let uri_path = req.uri().path();
+    if is_static_file_request(uri_path) {
+        return handle_static_file_request(uri_path).await;
+    }
+
     // Extract request data
     let method = req.method().clone();
     let uri = req.uri().clone();
@@ -145,6 +150,100 @@ async fn handle_request(req: Request<Body>, socket_bridge: Arc<SocketBridge>) ->
             error!("Error forwarding request to Laravel: {}", e);
             Ok(internal_server_error())
         }
+    }
+}
+
+/// Check if the request is for a static file
+fn is_static_file_request(uri_path: &str) -> bool {
+    // Check if the URI path contains file extensions typical for static files
+    let static_extensions = [
+        ".ico", ".css", ".js", ".png", ".jpg", ".jpeg", ".gif", ".svg",
+        ".woff", ".woff2", ".ttf", ".eot", ".pdf", ".txt", ".json",
+        ".xml", ".map", ".webp", ".avif"
+    ];
+    
+    for ext in &static_extensions {
+        if uri_path.ends_with(ext) {
+            return true;
+        }
+    }
+    
+    // Also handle common static file paths
+    uri_path == "/favicon.ico" || uri_path.starts_with("/assets/") || uri_path.starts_with("/build/")
+}
+
+/// Handle static file requests
+async fn handle_static_file_request(uri_path: &str) -> Result<Response<Body>, hyper::Error> {
+    // Determine the file path relative to the public directory
+    // In Laravel, static files are typically served from the public/ directory
+    let file_path = if uri_path == "/favicon.ico" {
+        // Special case for favicon.ico
+        format!("../public{}", uri_path)
+    } else {
+        // For other static files, construct the path relative to public directory
+        format!("../public{}", uri_path)
+    };
+
+    // Read the file
+    match tokio::fs::read(&file_path).await {
+        Ok(contents) => {
+            // Determine the content type based on file extension
+            let content_type = get_content_type(&file_path);
+            
+            let mut response = Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, content_type)
+                .header(header::CONTENT_LENGTH, contents.len());
+
+            // Add caching headers for static assets
+            if uri_path.starts_with("/build/") || uri_path.contains('.') && !uri_path.ends_with(".html") {
+                // These are likely versioned assets that can be cached long-term
+                response = response.header(header::CACHE_CONTROL, "public, max-age=31536000"); // 1 year
+            } else {
+                // Other assets might change more frequently
+                response = response.header(header::CACHE_CONTROL, "public, max-age=86400"); // 1 day
+            }
+
+            Ok(response.body(Body::from(contents)).unwrap())
+        }
+        Err(_) => {
+            // File not found - return 404
+            Ok(Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(Body::from("File not found"))
+                .unwrap())
+        }
+    }
+}
+
+/// Determine content type based on file extension
+fn get_content_type(file_path: &str) -> &'static str {
+    let extension = std::path::Path::new(file_path)
+        .extension()
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or("")
+        .to_lowercase();
+
+    match extension.as_str() {
+        "html" | "htm" => "text/html",
+        "css" => "text/css",
+        "js" | "mjs" => "application/javascript",
+        "json" => "application/json",
+        "xml" => "application/xml",
+        "txt" => "text/plain",
+        "ico" => "image/vnd.microsoft.icon",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "avif" => "image/avif",
+        "woff" => "font/woff",
+        "woff2" => "font/woff2",
+        "ttf" => "font/ttf",
+        "eot" => "application/vnd.ms-fontobject",
+        "pdf" => "application/pdf",
+        _ => "application/octet-stream", // Default binary type
     }
 }
 

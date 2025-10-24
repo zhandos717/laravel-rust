@@ -10,9 +10,22 @@ repository = "https://github.com/zhandos717/laravel-rust-server"
 name = "laravel-rust-server"
 path = "src/main.rs"
 
+[[bin]]
+name = "test_static_files"
+path = "test_static_files.rs"
+
+[[bin]]
+name = "test_static_only"
+path = "test_static_only.rs"
+
+[[bin]]
+name = "test_static_logic"
+path = "test_static_logic.rs"
+
 [lib]
 name = "laravel_rust_server"
 crate-type = ["cdylib", "rlib"]
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 hyper = { version = "0.14", features = ["full"] }
@@ -28,7 +41,7 @@ anyhow = "1.0"
 reqwest = { version = "0.11", features = ["json"] }
 tempfile = "3.0"
 tracing = "0.1"
-tracing-subscriber = "0.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 urlencoding = "2.1"
 base64 = "0.21"
 ctrlc = { version = "3.4", features = ["termination"] }

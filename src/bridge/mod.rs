@@ -1,5 +1,4 @@
 pub mod socket_bridge;
-pub mod worker_manager;
 
 use serde::{Deserialize, Serialize};
 
@@ -12,6 +11,7 @@ pub struct PhpResponse {
 }
 
 impl PhpResponse {
+    #[allow(dead_code)]
     pub fn new_success(id: Option<String>, data: Option<serde_json::Value>) -> Self {
         Self {
             id,
@@ -20,7 +20,8 @@ impl PhpResponse {
             error: None,
         }
     }
-
+    
+    #[allow(dead_code)]
     pub fn new_error(id: Option<String>, error: String) -> Self {
         Self {
             id,

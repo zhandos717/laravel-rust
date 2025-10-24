@@ -84,6 +84,8 @@ All configuration is handled through environment variables:
 | `PHP_PATH` | php | Path to PHP executable |
 | `LARAVEL_PATH` | Current directory | Path to Laravel application |
 | `LOG_LEVEL` | info | Logging level (trace, debug, info, warn, error) |
+| `LOG_DIR` | ./logs | Directory for log files |
+| `STARTUP_COMMAND` | laravel-rust:serve | Laravel Artisan command to start the PHP worker |
 
 ## Performance Optimizations
 

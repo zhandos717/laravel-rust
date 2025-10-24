@@ -1,16 +1,9 @@
-#![warn(unused_imports)]
-#![warn(unused_variables)]
-#![warn(unused_mut)]
-#![allow(dead_code)]
-#![allow(unused_variables)]
-#![allow(unused_imports)]
-
+use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
-use std::os::unix::net::UnixStream;
 
 mod bridge;
 mod server;
@@ -18,6 +11,9 @@ use server::HttpServer;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Инициализируем систему логирования
+    init_logging()?;
+
     // Устанавливаем обработчик сигналов для корректного завершения
     let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
@@ -41,7 +37,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let socket_path = std::env::var("SOCKET_PATH").unwrap_or_else(|_| "/tmp/rust_php_bridge.sock".to_string());
     let mut attempts = 0;
     let max_attempts = 20; // 10 seconds max wait
-    
+
     println!("⏳ Ожидаем готовности PHP worker и сокета...");
     while attempts < max_attempts {
         if std::path::Path::new(&socket_path).exists() {
@@ -62,7 +58,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             attempts += 1;
         }
     }
-    
+
     if attempts >= max_attempts {
         eprintln!("⚠️ PHP worker не готов к подключению в течение 10 секунд");
     }
@@ -117,26 +113,90 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     Ok(())
 }
 
+/// Инициализация системы логирования с поддержкой записи в файл
+fn init_logging() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use std::fs;
+    use tracing_subscriber::fmt;
+    use tracing_subscriber::EnvFilter;
+    use tracing_subscriber::prelude::__tracing_subscriber_SubscriberExt;
+    use tracing_subscriber::Layer;
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    // Загружаем переменные окружения
+    dotenvy::dotenv().ok();
+
+    // Получаем уровень логирования из переменной окружения
+    let log_level = std::env::var("LOG_LEVEL").unwrap_or_else(|_| "info".to_string());
+
+    // Получаем директорию для логов из переменной окружения
+    let log_dir = std::env::var("LOG_DIR").unwrap_or_else(|_| "./logs".to_string());
+
+    // Создаем директорию для логов, если она не существует
+    fs::create_dir_all(&log_dir)?;
+
+    // Создаем файл для логов
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .append(true)
+        .open(Path::new(&log_dir).join("server.log"))?;
+
+    // Настройка фильтрации по уровню логирования
+    let env_filter = EnvFilter::try_from_default_env()
+        .unwrap_or(EnvFilter::new(&format!("laravel-rust-server={},hyper=info", log_level)));
+
+    // Настройка форматирования логов в файл
+    let file_layer = fmt::layer()
+        .with_writer(log_file)
+        .with_ansi(false) // Отключаем цвета в файле
+        .with_target(true)
+        .with_line_number(true)
+        .with_filter(env_filter.clone()); // Клонируем фильтр для использования в нескольких слоях
+
+    // Настройка консольного вывода
+    let stdout_layer = fmt::layer()
+        .with_writer(std::io::stderr)
+        .with_ansi(true)
+        .with_target(true)
+        .with_line_number(true)
+        .with_filter(env_filter); // Используем оригинальный фильтр
+
+    // Инициализируем глобальный subscriber с обеими записями
+    tracing_subscriber::registry()
+        .with(file_layer)
+        .with(stdout_layer)
+        .init();
+
+    Ok(())
+}
+
 fn start_php_worker() -> Result<std::process::Child, Box<dyn std::error::Error + Send + Sync + 'static>> {
     // Получаем путь к PHP из переменной окружения или используем стандартный
     let php_path = std::env::var("PHP_PATH").unwrap_or_else(|_| "php".to_string());
-    
+
     // Получаем путь к Laravel проекту
     let laravel_path = std::env::var("LARAVEL_PATH").unwrap_or_else(|_| {
         // Если LARAVEL_PATH не задан, используем родительскую директорию от текущей (rust-runtime)
         let current_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-        current_dir.parent().unwrap_or(&current_dir).to_string_lossy().to_string()
+        current_dir
+            .parent()
+            .unwrap_or(&current_dir)
+            .to_string_lossy()
+            .to_string()
     });
-    
+
     let artisan_path = std::path::Path::new(&laravel_path).join("artisan");
 
     if !artisan_path.exists() {
         return Err(format!("Файл artisan не найден по пути: {:?}", artisan_path).into());
     }
 
-    // Запускаем PHP artisan worker:serve
+    // Получаем команду запуска из переменной окружения
+    let startup_command = std::env::var("STARTUP_COMMAND").unwrap_or_else(|_| "laravel-rust:serve".to_string());
+
+    // Запускаем PHP artisan с командой из переменной окружения
     let mut cmd = Command::new(&php_path);
-    cmd.arg(&artisan_path).arg("worker:serve").current_dir(&laravel_path); // Устанавливаем директорию в корень Laravel проекта
+    cmd.arg(&artisan_path).arg(&startup_command).current_dir(&laravel_path); // Устанавливаем директорию в корень Laravel проекта
 
     let child = cmd
         .spawn()
