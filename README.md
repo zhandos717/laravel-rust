@@ -164,3 +164,62 @@ Enable debug logging by setting `LOG_LEVEL=debug` in your environment.
 ## License
 
 MIT License - see the LICENSE file for details.
+
+## Performance Benchmark
+
+We conducted a comparative performance test between the Rust server and PHP-FPM (Artisan server) to demonstrate the performance characteristics of our Laravel Rust Bridge.
+
+### Benchmark Results
+
+```
+🚀 Запуск сравнительного тестирования Rust-сервера и PHP-FPM (Artisan server)...
+📊 Параметры теста:
+  - Всего запросов: 1000
+  - Параллельных запросов: 50
+
+🧪 Тестирование Rust-сервера...
+
+🧪 Тестирование PHP-FPM (Artisan server)...
+
+📈 Результаты для Rust-сервер:
+  - Всего запросов: 1000
+ - Успешных запросов: 1000
+  - Неудачных запросов: 0
+  - Общее время выполнения: 8.392928208s
+ - Среднее время ответа: 394.565043ms
+  - Минимальное время ответа: 24.74675ms
+  - Максимальное время ответа: 1.186580958s
+  - Пропускная способность: 119.15 RPS
+
+📈 Результаты для PHP-FPM (Artisan server):
+  - Всего запросов: 1000
+ - Успешных запросов: 1000
+  - Неудачных запросов: 0
+  - Общее время выполнения: 4.105359167s
+  - Среднее время ответа: 194.685871ms
+  - Минимальное время ответа: 58.346666ms
+  - Максимальное время ответа: 687.133833ms
+  - Пропускная способность: 243.58 RPS
+
+📊 Сравнение производительности:
+  Среднее время ответа:
+    Rust-сервер:           394.565043ms
+    PHP-FPM (Artisan):     194.685871ms
+  ⚠️ PHP-FPM быстрее на 103.09%
+  Пропускная способность:
+    Rust-сервер:           119.15 RPS
+    PHP-FPM (Artisan):     243.58 RPS
+  ⚠️  PHP-FPM пропускает на 104.44 % больше запросов в секунду
+```
+
+### Benchmark Analysis
+
+The benchmark reveals that in this specific configuration, the PHP-FPM (Artisan server) outperforms the Rust bridge server in both response time and requests per second. This result may seem counterintuitive given Rust's performance characteristics, but it's important to note that the Rust bridge involves additional overhead due to:
+
+1. HTTP request parsing in Rust
+2. Communication through Unix socket to PHP process
+3. Response processing and forwarding back to client
+
+The performance difference highlights the importance of considering the entire system architecture. While Rust is faster in raw computational tasks, the overhead of inter-process communication and the complexity of bridging between Rust and PHP can offset those gains in this specific use case.
+
+For applications with heavy computational requirements, the Rust bridge would likely show more significant benefits. For typical web applications with standard database and I/O operations, the native PHP-FPM implementation may be more efficient.

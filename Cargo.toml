@@ -38,6 +38,22 @@ path = "test_first_request_performance.rs"
 name = "load_test"
 path = "load_test.rs"
 
+[[bin]]
+name = "benchmark_comparison"
+path = "benchmark_comparison.rs"
+
+[[bin]]
+name = "rust_server_benchmark"
+path = "rust_server_benchmark.rs"
+
+[[bin]]
+name = "load_test_detailed"
+path = "load_test_detailed.rs"
+
+[[bin]]
+name = "simple_performance_test"
+path = "simple_performance_test.rs"
+
 [lib]
 name = "laravel_rust_server"
 crate-type = ["cdylib", "rlib"]
